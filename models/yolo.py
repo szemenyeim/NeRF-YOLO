@@ -578,7 +578,7 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, x, augment=False, profile=False, feature=False):
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -596,9 +596,9 @@ class Model(nn.Module):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+            return self.forward_once(x, profile, feature)  # single-scale inference, train
 
-    def forward_once(self, x, profile=False):
+    def forward_once(self, x, profile=False, feature = False):
         y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -628,6 +628,8 @@ class Model(nn.Module):
 
         if profile:
             print('%.1fms total' % sum(dt))
+        if feature:
+            return y[-4:-1]
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
