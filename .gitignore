@@ -23,6 +23,8 @@
 !setup.cfg
 !cfg/yolov3*.cfg
 
+nerfData/*
+
 storage.googleapis.com
 runs/*
 data/*
