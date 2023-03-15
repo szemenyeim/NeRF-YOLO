@@ -104,13 +104,23 @@ def assembleAttMTX(depths, distances, nviews, alpha):
 
 if __name__ == '__main__':
 
-    numData = 4000
     nViews = 4
-    imgSize = 1280
-    alpha = 50*imgSize/640
+    baseImgSize = 640
+    baseNumData = 640
+    dataMults = [30, 10, 1, 2]
 
-    outPath = "./nerfData/out/" + str(imgSize) + "/"
-    inPath = "./nerfData/in/" + str(imgSize) + "/"
+    split = "train/"
+    scale = 1
+
+    imgSize = baseImgSize*scale
+    numData = baseNumData*dataMults[scale-1]
+    if split != "train/":
+        numData = numData // 4
+
+    alpha = 75*scale
+
+    outPath = "./nerfData/" + split + "out/" + str(imgSize) + "/"
+    inPath = "./nerfData/" + split + "in/" + str(imgSize) + "/"
 
     os.makedirs(outPath, exist_ok=True)
     os.makedirs(inPath, exist_ok=True)
@@ -139,4 +149,7 @@ if __name__ == '__main__':
         torch.save(attns, outPath + fname)
 
         fname = "in" + "{:05d}".format(i) + ".pt"
-        torch.save(rays, inPath + fname)
+        torch.save(rays[0], inPath + fname)
+
+        fname = "in" + "{:05d}".format(i) + ".pose"
+        torch.save(poses, inPath + fname)
