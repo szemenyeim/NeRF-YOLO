@@ -4,6 +4,15 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+class SmoothNLLLoss(nn.Module):
+    def __init__(self):
+        super(SmoothNLLLoss, self).__init__()
+
+    def forward(self, pred, target_probs):
+        loss = (torch.log(pred)*target_probs).sum(dim=-1)
+        total_loss = loss.mean()
+        return total_loss
+
 def generateAttentionMask(bsize, size, nviews):
     baseMask = torch.ones((size*nviews, size*nviews)).cuda()*-1e12
     zeros = torch.zeros((size, size)).cuda()

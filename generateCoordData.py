@@ -109,7 +109,7 @@ if __name__ == '__main__':
     baseNumData = 640
     dataMults = [30, 10, 1, 2]
 
-    split = "train/"
+    split = "val/"
     scale = 1
 
     imgSize = baseImgSize*scale

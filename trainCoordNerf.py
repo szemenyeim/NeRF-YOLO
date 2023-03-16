@@ -1,7 +1,7 @@
 import torch
 from data.nerfDataSet import NeRFDataSet
 from torch.utils.data import DataLoader
-from models.nerfAttention import NeRFAttention
+from models.nerfAttention import NeRFAttention, SmoothNLLLoss
 import tqdm
 
 if __name__ == '__main__':
@@ -37,8 +37,9 @@ if __name__ == '__main__':
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, numEpoch, lr)
 
     #criterion = torch.nn.SmoothL1Loss(beta=0.1).cuda()
+    criterion = torch.nn.BCELoss()
+    criterion = SmoothNLLLoss()
 
-    criterion = torch.nn.CrossEntropyLoss()
 
     bestLoss = 100000
 
