@@ -3,6 +3,8 @@ import logging
 import sys
 from copy import deepcopy
 
+from utils.CoordNerfUtils import *
+
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 import torch
@@ -577,6 +579,28 @@ class Model(nn.Module):
         initialize_weights(self)
         self.info()
         logger.info('')
+
+    def forward_MV(self, x, depth, poses, imSize, profile=False):
+
+        features = self.foward(x, feature=True)
+
+        sizes = [feat.shape[-2:] for feat in features]
+
+        hists = createDepthHistograms(depth, sizes)
+
+        rays = generateRays(poses, sizes, imSize)
+
+        newFeature = []
+        for ray, hist, feature in zip(rays, hists, features):
+            with torch.no_grad():
+                weights = getIntersectionWeights(ray, poses, hist)
+            b, ch, H, W = feature.shape
+            feature = feature.permute(0, 2, 3, 1).reshape(-1, feature.shape[1])
+            newFeature.append(torch.mm(weights, feature).reshape(b, H, W, ch).permute(0, 3, 1, 2))
+
+        res = model.model[-1](newFeature)
+
+        return res
 
     def forward(self, x, augment=False, profile=False, feature=False):
         if augment:
