@@ -87,34 +87,31 @@ if __name__ == '__main__':
 
     poses = createPoses()
 
-    feature = model(imgs, feature=True)
+    features = model(imgs, feature=True)
 
-    st = time.time()
-
-    sizes = [feat.shape[-2:] for feat in feature]
+    sizes = [feat.shape[-2:] for feat in features]
 
     nSize = len(sizes)
+
+    A = torch.tensor([
+        [focal, 0, imgsz/2],
+        [0, focal, imgsz/4],
+        [0, 0, 1],
+    ]).cuda()
 
     hists = createDepthHistograms(depths, sizes)
 
     rays = generateRays(poses, sizes, imgsz)
 
-    distances, depths = getAllRayIntersections(rays, poses)
+    st = time.time()
 
-    newFeature = [torch.zeros(feat.shape).to(device) for feat in feature]
-
-    for i in range(nviews):
-        key_indices = [n for n in range(nviews) if n != i]
-        for j in range(nSize):
-            img_q = feature[j][i]
-            img_k = feature[j][key_indices]
-
-            dists, depth_q, depth_k = getElements(distances[j], depths[j], i, key_indices)
-
-            feat_sum = sumFeatures(feature[j], dists, i,  key_indices)
-            feat_wsum = sumFeaturesDepthHist(feature[j], dists, i,  key_indices, hists[j], depth_k)
-            feat_attsum = sumFeaturesDepthAttention(feature[j], dists, hists[j], depth_q, depth_k)
-            newFeature[j][i] = feat_sum
+    newFeature = []
+    for ray, hist, feature in zip(rays, hists, features):
+        with torch.no_grad():
+            weights = getIntersectionWeights(ray, poses, hist)
+        b, ch, H, W = feature.shape
+        feature = feature.permute(0,2,3,1).reshape(-1, feature.shape[1])
+        newFeature.append(torch.mm(weights,feature).reshape(b, H, W, ch).permute(0, 3, 1, 2))
 
     et = time.time()
 

@@ -55,6 +55,75 @@ def generateRays(poses, sizes, imSize, device = 'cuda:0'):
         rays.append(torch.stack(trRays))
     return rays
 
+def getIntersectionWeights(rays, poses, hists, device = 'cuda:0'):
+
+    nviews, HW, _ = rays.shape
+
+    weights = torch.diag(torch.ones(HW).to(device))
+    weights = weights.repeat(nviews, nviews)
+
+    alpha = 50
+
+    pos = poses[:, 0:3, 3]
+
+    indices = torch.arange(HW * HW).to(device)
+
+    for i in range(nviews-1):
+        for j in range(i+1, nviews):
+
+            dist = pos[j]-pos[i]
+
+            query_rays = rays[i].view(-1, 3)
+            key_rays = rays[j].view(-1, 3)
+            num_rays = query_rays.shape[0]
+
+            hist_q = hists[i].reshape(HW, -1).repeat(num_rays, 1)
+            hist_k = torch.repeat_interleave(hists[j].reshape(HW, -1), num_rays, 0)
+
+            Qmtx = query_rays.repeat(num_rays, 1)
+            Kmtx = torch.repeat_interleave(key_rays, num_rays, 0)
+
+            normals = torch.linalg.cross(Qmtx, Kmtx)
+            norm_factor = 1.0/torch.norm(normals, 2, dim=1)
+
+            pos_1 = torch.linalg.cross(Kmtx, normals)
+            pos_2 = torch.linalg.cross(Qmtx, normals)
+
+            intersection_dist_1 = torch.mm(pos_1, dist.unsqueeze(1)).squeeze()*norm_factor
+            intersection_dist_2 = torch.mm(pos_2, dist.unsqueeze(1)).squeeze()*norm_factor
+
+            intersection_1 = pos[j] + intersection_dist_1.unsqueeze(1)*Kmtx
+            intersection_2 = pos[i] + intersection_dist_2.unsqueeze(1)*Qmtx
+
+            transformed_1 = torch.mm(poses[i, 0:3, 0:3], intersection_1.T).T + pos[i]
+            transformed_2 = torch.mm(poses[j, 0:3, 0:3], intersection_2.T).T + pos[j]
+
+            transformed_1 = (transformed_1/(transformed_1[..., 2:3]+1e-7)).reshape(num_rays, num_rays, -1)
+            transformed_2 = (transformed_2/(transformed_2[..., 2:3]+1e-7)).reshape(num_rays, num_rays, -1)
+
+            diffs_1 = ((transformed_1[..., :2] - Qmtx.reshape(num_rays, num_rays, -1)[..., :2])**2).sum(dim=-1)
+            diffs_2 = ((transformed_2[..., :2] - Kmtx.reshape(num_rays, num_rays, -1)[..., :2])**2).sum(dim=-1)
+
+            w_1 = torch.exp(-alpha * diffs_1)
+            w_1[w_1 < 0.1] = 0
+            w_hist_1 = hist_k[(indices, intersection_dist_2.round().long())]
+            # Normalize
+            w_1 = w_1 / (w_1.sum(dim=0)+1e-7)
+            weights[i*HW:(i+1)*HW,j*HW:(j+1)*HW] = w_1 * w_hist_1.reshape(HW, HW)
+
+            w_2 = torch.exp(-alpha * diffs_2)
+            w_2[w_2 < 0.1] = 0
+            w_hist_2 = hist_q[(indices, intersection_dist_1.round().long())]
+            # Normalize
+            w_2 = w_2 / (w_2.sum(dim=0)+1e-7)
+            weights[j*HW:(j+1)*HW,i*HW:(i+1)*HW] = w_2 * w_hist_2.reshape(HW, HW)
+
+            #projection = torch.mm(A, transformed.T).T
+            #projection = (projection[:, 0:2]/projection[:, 2:3]).reshape(num_rays, num_rays, -1)
+
+
+    return weights
+
 def getAllRayIntersections(rays, poses):
     distances = []
     depths = []
