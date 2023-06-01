@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-focal = 1000
+#focal = 1000
 
 def createDepthHistograms(depths, sizes):
 
@@ -26,6 +26,13 @@ def createDepthHistograms(depths, sizes):
     return hists
 
 def generateRays(poses, sizes, imSize, device = 'cuda:0'):
+
+    intr, extr = poses
+
+    focal = intr[0, 0]
+    #px = intr[0, 2]
+    #py = intr[1, 2]
+
     baseRays = []
     # Three sizes for three yolo levels
     for size in sizes:
@@ -48,7 +55,7 @@ def generateRays(poses, sizes, imSize, device = 'cuda:0'):
     rays = []
     for bRay in baseRays:
         trRays = []
-        for pose in poses:
+        for pose in extr:
             # Use just rotation, translation will be accounted for later on
             trRay = torch.matmul(pose[:3, :3], bRay.T).T
             trRays.append(trRay)
@@ -63,6 +70,8 @@ def getIntersectionWeights(rays, poses, hists, device = 'cuda:0'):
     weights = weights.repeat(nviews, nviews)
 
     alpha = 50
+
+    poses = poses[1]
 
     pos = poses[:, 0:3, 3]
 
