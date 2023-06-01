@@ -24,6 +24,7 @@
 !cfg/yolov3*.cfg
 
 nerfData/*
+all_renders/*
 
 storage.googleapis.com
 runs/*
