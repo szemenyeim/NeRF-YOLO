@@ -135,20 +135,20 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         h = math.ceil(scale_factor * h)
         w = math.ceil(scale_factor * w)
 
-    colors = color_list()  # list of colors
-    mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
+    colors = color_list()  # list of colorsinit
     for i, img in enumerate(images):
+        mosaic = np.full((int(h), int(w), 3), 255, dtype=np.uint8)  #
         if i == max_subplots:  # if last batch has fewer images than we expect
             break
 
-        block_x = int(w * (i // ns))
-        block_y = int(h * (i % ns))
+        #block_x = int(w * (i // ns))
+        #block_y = int(h * (i % ns))
 
         img = img.transpose(1, 2, 0)
         if scale_factor < 1:
             img = cv2.resize(img, (w, h))
 
-        mosaic[block_y:block_y + h, block_x:block_x + w, :] = img
+        mosaic[:, :, :] = img
         if len(targets) > 0:
             image_targets = targets[targets[:, 0] == i]
             boxes = xywh2xyxy(image_targets[:, 2:6]).T
@@ -162,8 +162,8 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
                     boxes[[1, 3]] *= h
                 elif scale_factor < 1:  # absolute coords need scale if image scales
                     boxes *= scale_factor
-            boxes[[0, 2]] += block_x
-            boxes[[1, 3]] += block_y
+            #boxes[[0, 2]] += block_x
+            #boxes[[1, 3]] += block_y
             for j, box in enumerate(boxes.T):
                 cls = int(classes[j])
                 color = colors[cls % len(colors)]
@@ -175,18 +175,18 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         # Draw image filename labels
         if paths:
             label = Path(paths[i]).name[:40]  # trim to 40 char
-            t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-            cv2.putText(mosaic, label, (block_x + 5, block_y + t_size[1] + 5), 0, tl / 3, [220, 220, 220], thickness=tf,
-                        lineType=cv2.LINE_AA)
+            #t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+            #cv2.putText(img, label, (5, t_size[1] + 5), 0, tl / 3, [220, 220, 220], thickness=tf,
+            #            lineType=cv2.LINE_AA)
 
         # Image border
-        cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
+        #cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
 
-    if fname:
-        r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
-        mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
-        # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
-        Image.fromarray(mosaic).save(fname)  # PIL save
+        if fname:
+            r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
+            mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
+            # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
+            Image.fromarray(mosaic).save(fname[i])  # PIL save
     return mosaic
 
 

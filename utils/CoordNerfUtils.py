@@ -4,6 +4,101 @@ import torch.nn.functional as F
 
 #focal = 1000
 
+def getDepthsAvgs(depths, sizes):
+
+    outDepths= []
+
+    for size in sizes:
+        factor = depths.shape[2]//size[0]
+        outDepths.append(F.avg_pool2d(depths, factor, factor))
+
+    return outDepths
+
+
+def get3DPoints(poses, sizes, imSize, depths, device = 'cuda:0'):
+
+    intr, extr = poses
+    focal = intr[0, 0, 0]
+    px = intr[0, 0, 2]
+    py = intr[0, 1, 2]
+
+    depthsAvg = getDepthsAvgs(depths, sizes)
+
+    pts3D = []
+
+    for size, depth in zip(sizes, depthsAvg):
+        patch_size = imSize//size[1]
+        # Image coordinate grid
+        y = torch.arange(0, size[0])
+        x = torch.arange(0, size[1])
+        grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+        # Offset with actual sizes
+        grid_x = grid_x*patch_size + patch_size//2
+        grid_y = grid_y*patch_size + patch_size//2
+        # Principal points in image center
+        px = imSize//2
+        py = imSize//4
+        # Compute rays
+        rays = torch.tensor([[(u-px)/focal, -(v-py)/focal, 1] for u,v in zip(grid_x.flatten(), grid_y.flatten())]).float().to(device)
+
+        transCoords = []
+        for i in range(extr.shape[0]):
+            coords = rays*(depth[i].flatten().unsqueeze(1))
+            coords = torch.hstack([coords, torch.ones(coords.shape[0], 1).to(coords.device)])
+            transCoords.append(torch.matmul(torch.inverse(extr[i]), coords.T).T)
+        pts3D.append(torch.stack(transCoords, 0))
+
+    return pts3D
+
+def project3DPoints(poses, depths, sizes, imSize, features, alpha = 0.5):
+
+    pts3Ds = get3DPoints(poses, sizes, imSize, depths)
+
+    intr, extr = poses
+    intr = intr[0]
+    nViews = extr.shape[0]
+
+    newFeatures = []
+
+    for size, pts3D, feature in zip(sizes, pts3Ds, features):
+        finalFeat = []
+        ratio = imSize//size[0]
+        for i, pose in enumerate(extr):
+            otherViewIdx = [torch.arange(0,nViews) != i]
+            otherPts = pts3D[otherViewIdx].view(-1, 4)
+            numPts = otherPts.shape[0]
+
+            valid = torch.ones(numPts).to(otherPts.device)
+
+            trPts = torch.matmul(pose, otherPts.T).T
+
+            #trPts[1] *= -1
+            #trPts[2] *= -1
+            valid[trPts[:,2] < 0] = 0
+
+            pts2D = torch.matmul(intr, trPts.T).T
+            pts2D = pts2D[:, :2] / pts2D[:, 2:] / ratio
+            pts2D = torch.round(pts2D)
+            valid[pts2D[:,1] < 0] = 0
+            valid[pts2D[:,0] < 0] = 0
+            valid[pts2D[:,1] >= size[1]] = 0
+            valid[pts2D[:,0] >= size[0]] = 0
+
+            #print(valid.sum())
+
+            validFeat = feature[otherViewIdx].view(numPts, -1)[valid.bool()]
+            validPts = pts2D[valid.bool()]
+
+            final = feature[i].permute(1,2,0)
+            if validPts.shape[0]:
+                #final.index_put(validPts, alpha*validFeat, accumulate=True)
+                final[validPts[:, 0].long(), validPts[:, 1].long(), :] += alpha*validFeat
+            final = final.permute(2,0,1)
+            finalFeat.append(final)
+        newFeatures.append(torch.stack(finalFeat, 0))
+    return newFeatures
+
+
 def createDepthHistograms(depths, sizes):
 
     hists = []
@@ -29,7 +124,7 @@ def generateRays(poses, sizes, imSize, device = 'cuda:0'):
 
     intr, extr = poses
 
-    focal = intr[0, 0]
+    focal = intr[0, 0, 0]
     #px = intr[0, 2]
     #py = intr[1, 2]
 

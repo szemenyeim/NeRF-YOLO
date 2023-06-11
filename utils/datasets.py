@@ -36,6 +36,27 @@ img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']
 vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 logger = logging.getLogger(__name__)
 
+
+def npz2BB(npz, intr, extr, imgSize):
+    keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+    pts = torch.from_numpy(np.vstack([npz[key] for key in keys]).T)
+    pts = torch.vstack([pts, torch.ones(1, 8)])
+    pts3D = torch.matmul(extr, pts)
+    #pts3D = torch.vstack([pts3D[0], pts3D[2], pts3D[1], pts3D[3]])
+    pts3D[1]*=-1
+    pts3D[2]*=-1
+    pts2D = torch.matmul(intr, pts3D)
+    pts2D = pts2D[:2, :] / pts2D[2, :]
+    BB = torch.min(pts2D[0, :]), torch.min(pts2D[1, :]), torch.max(pts2D[0, :]), torch.max(pts2D[1, :])
+    x = (BB[0] + BB[2]) / 2.0 / imgSize[0]
+    y = (BB[1] + BB[3]) / 2.0 / imgSize[1]
+    w = (BB[2] - BB[0]) / imgSize[0]
+    h = (BB[3] - BB[1]) / imgSize[1]
+    if (pts3D[2,:] < 0).any():
+        return torch.tensor([-1, -1, -1, -1])
+
+    return torch.tensor([x, y, w, h])
+
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == 'Orientation':
@@ -90,6 +111,34 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
     return dataloader, dataset
 
+
+def create_dataloader_nerf(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    with torch_distributed_zero_first(rank):
+        dataset = LoadImagesAndLabelsAndPoses(path, imgsz, batch_size,
+                                      augment=augment,  # augment images
+                                      hyp=hyp,  # augmentation hyperparameters
+                                      rect=rect,  # rectangular training
+                                      cache_images=cache,
+                                      single_cls=opt.single_cls,
+                                      stride=int(stride),
+                                      pad=pad,
+                                      image_weights=image_weights,
+                                      prefix=prefix)
+
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
+    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
+    dataloader = loader(dataset,
+                        batch_size=batch_size,
+                        num_workers=nw,
+                        sampler=sampler,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabelsAndPoses.collate_fn4 if quad else LoadImagesAndLabelsAndPoses.collate_fn)
+    return dataloader, dataset
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
     """ Dataloader that reuses workers
@@ -679,21 +728,26 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
         self.scene_dirs = glob.glob1(path, "scene*")
         self.img_files = []
         self.depth_files = []
-        self.pose_files = []
-        self.label_files = []
+        self.intr_files = []
+        self.extr_files = []
+        self.car_files = []
+        self.human_files = []
 
         for dir in self.scene_dirs:
-            imgs = glob.glob1(dir, "image*.png")
-            depths = glob.glob1(dir, "image*.png")
-            extr = glob.glob1(dir, "extr*.npy")
-            intr = glob.glob1(dir, "intr*.npy")
-            cars = glob.glob1(dir+"/bounding_boxes", "car*.npz")
-            humans = glob.glob1(dir+"/bounding_boxes", "human*.npz")
+            currDir = os.path.join(path, dir)
+            imgs = glob.glob1(currDir, "image*.png")
+            depths = glob.glob1(currDir, "depth*.png")
+            extr = glob.glob1(currDir, "extr*.npy")
+            intr = glob.glob1(currDir, "intr*.npy")
+            cars = glob.glob1(currDir+"/bounding_boxes", "car*.npz")
+            humans = glob.glob1(currDir+"/bounding_boxes", "human*.npz")
 
             self.img_files.append(imgs)
             self.depth_files.append(depths)
-            self.pose_files.append([intr,extr])
-            self.label_files.append(cars,humans)
+            self.intr_files.append(intr)
+            self.extr_files.append(extr)
+            self.car_files.append(cars)
+            self.human_files.append(humans)
 
 
     def __len__(self):
@@ -709,106 +763,145 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         hyp = self.hyp
 
-        path = self.img_files[index]
-        d_path = self.depth_files[index]
-        img = cv2.imread(path)  # BGR
-        depth = cv2.imread(d_path, -1)  # BGR
+        root = os.path.join(self.path, self.scene_dirs[index])
 
-        h0, w0 = img.shape[:2]  # orig hw
-        r = self.img_size / max(h0, w0)  # resize image to img_size
-        if r != 1:  # always resize down, only resize up if training with augmentation
-            interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            depth = cv2.resize(depth, (int(w0 * r), int(h0 * r)), interpolation=interp)
-        (h,w) = img.shape[:2]  # img, hw_original, hw_resized
+        paths = self.img_files[index]
+        d_paths = self.depth_files[index]
+        car_files = self.car_files[index]
+        human_files = self.human_files[index]
+        intr_filess = self.intr_files[index]
+        extr_filess = self.extr_files[index]
 
-        # TODO: Read extr, intr, and resize
-        pose_files = self.pose_files[index]
-        intr = torch.from_numpy(np.load(pose_files[0]))*r
-        extr = torch.from_numpy(np.load(pose_files[1]))
+        images = []
+        depths = []
+        labels_ = []
+        extrs = []
+        intrs = []
+        shapes = [[]]
 
-        # Letterbox
-        shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-        img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-        shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+        for i, (path, d_path, intr_files, extr_files) in enumerate(zip(paths, d_paths, intr_filess, extr_filess)):
+            path = os.path.join(root, path)
+            d_path = os.path.join(root, d_path)
 
-        # TODO: Read labels
-        lab_files = self.label_files[index]
-        cars = torch.from_numpy(np.load(lab_files[0]))
-        humans = torch.from_numpy(np.load(lab_files[1]))
+            img = cv2.imread(path)  # BGR
+            depth = cv2.imread(d_path, -1)  # BGR
 
-        cars = torch.hstack([np.zeros(cars.shape[0]), cars])
-        humans = torch.hstack([np.ones(humans.shape[0]), humans])
-        labels = torch.vstack([cars, humans])
+            h0, w0 = img.shape[:2]  # orig hw
+            r = self.img_size / max(h0, w0)  # resize image to img_size
+            if r != 1:  # always resize down, only resize up if training with augmentation
+                interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+                img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+                depth = cv2.resize(depth, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            (h,w) = img.shape[:2]  # img, hw_original, hw_resized
 
-        if labels.size:  # normalized xywh to pixel xyxy format
-            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            # TODO: Read extr, intr, and resize
+            intr_files = os.path.join(root, intr_files)
+            extr_files = os.path.join(root, extr_files)
+            intr = torch.from_numpy(np.load(intr_files))*r
+            intr[2,2] = 1
+            extr = torch.from_numpy(np.load(extr_files))
 
-        if self.augment:
-            # Augment imagespace
-            img, labels = random_perspective(img, labels,
-                                             degrees=hyp['degrees'],
-                                             translate=hyp['translate'],
-                                             scale=hyp['scale'],
-                                             shear=hyp['shear'],
-                                             perspective=hyp['perspective'])
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            depth, ratio, pad = letterbox(depth, shape, auto=False, scaleup=self.augment)
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shape = [(h0, w0), ((h / h0, w / w0), pad)]  # for COCO mAP rescaling
 
-            # img, labels = self.albumentations(img, labels)
+            # TODO: Read labels
+            cars = [npz2BB(np.load(os.path.join(root + "/bounding_boxes", car_file)), intr, extr, [w,h]) for car_file in car_files]
+            humans = [npz2BB(np.load(os.path.join(root + "/bounding_boxes", human_file)), intr, extr, [w,h]) for human_file in human_files]
 
-            # Augment colorspace
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            cars = [car for car in cars if car[0] != -1]
+            humans = [human for human in humans if human[0] != -1]
 
-            # Apply cutouts
-            # if random.random() < 0.9:
-            #     labels = cutout(img, labels)
+            label_s = []
 
-            if random.random() < hyp['paste_in']:
-                sample_labels, sample_images, sample_masks = [], [], []
-                while len(sample_labels) < 30:
-                    sample_labels_, sample_images_, sample_masks_ = load_samples(self, random.randint(0,
-                                                                                                      len(self.labels) - 1))
-                    sample_labels += sample_labels_
-                    sample_images += sample_images_
-                    sample_masks += sample_masks_
-                    # print(len(sample_labels))
-                    if len(sample_labels) == 0:
-                        break
-                labels = pastein(img, labels, sample_labels, sample_images, sample_masks)
+            if len(cars):
+                cars = torch.vstack(cars)
+                cars = torch.hstack([torch.ones(cars.shape[0]).unsqueeze(1)*2, cars])
+                label_s.append(cars)
+            if len(humans):
+                humans = torch.vstack(humans)
+                humans = torch.hstack([torch.zeros(humans.shape[0]).unsqueeze(1), humans])
+                label_s.append(humans)
+            if len(label_s):
+                labels = torch.vstack(label_s)
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-        nL = len(labels)  # number of labels
-        if nL:
-            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
-            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
-            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+            if self.augment:
+                # Augment imagespace
+                img, labels = random_perspective(img, labels,
+                                                 degrees=hyp['degrees'],
+                                                 translate=hyp['translate'],
+                                                 scale=hyp['scale'],
+                                                 shear=hyp['shear'],
+                                                 perspective=hyp['perspective'])
 
-        if self.augment:
-            # flip up-down
-            if random.random() < hyp['flipud']:
-                img = np.flipud(img)
-                if nL:
-                    labels[:, 2] = 1 - labels[:, 2]
+                # img, labels = self.albumentations(img, labels)
 
-            # flip left-right
-            if random.random() < hyp['fliplr']:
-                img = np.fliplr(img)
-                if nL:
-                    labels[:, 1] = 1 - labels[:, 1]
+                # Augment colorspace
+                augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
-        labels_out = torch.zeros((nL, 6))
-        if nL:
-            labels_out[:, 1:] = torch.from_numpy(labels)
+                # Apply cutouts
+                # if random.random() < 0.9:
+                #     labels = cutout(img, labels)
 
-        # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
+                if random.random() < hyp['paste_in']:
+                    sample_labels, sample_images, sample_masks = [], [], []
+                    while len(sample_labels) < 30:
+                        sample_labels_, sample_images_, sample_masks_ = load_samples(self, random.randint(0,
+                                                                                                          len(self.labels) - 1))
+                        sample_labels += sample_labels_
+                        sample_images += sample_images_
+                        sample_masks += sample_masks_
+                        # print(len(sample_labels))
+                        if len(sample_labels) == 0:
+                            break
+                    labels = pastein(img, labels, sample_labels, sample_images, sample_masks)
 
-        return torch.from_numpy(img), torch.from_numpy(depth), labels_out, intr, extr, self.img_files[index], shapes
+            nL = len(labels)  # number of labels
+            if nL:
+                labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
+                labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
+                labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+
+            if self.augment:
+                # flip up-down
+                if random.random() < hyp['flipud']:
+                    img = np.flipud(img)
+                    if nL:
+                        labels[:, 2] = 1 - labels[:, 2]
+
+                # flip left-right
+                if random.random() < hyp['fliplr']:
+                    img = np.fliplr(img)
+                    if nL:
+                        labels[:, 1] = 1 - labels[:, 1]
+
+            labels_out = torch.zeros((nL, 6))
+            if nL:
+                labels_out[:, 1:] = labels
+                labels_out[:, 0] = i
+
+            # Convert
+            img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+            img = np.ascontiguousarray(img)  # BGR to RGB, to 3x416x416
+            depth = np.ascontiguousarray(depth)
+
+            images.append(torch.from_numpy(img))
+            depths.append(torch.from_numpy(depth.astype('float')).unsqueeze(0))
+            labels_.append(labels_out)
+            intrs.append(intr)
+            extrs.append(extr)
+            shapes.append(shape)
+
+        shapes = shapes[1:]
+
+        return torch.stack(images, 0), torch.stack(depths, 0), torch.cat(labels_, 0), torch.stack(intrs, 0), torch.stack(extrs, 0), self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(batch):
         img, depth, label, intr, extr, path, shapes = zip(*batch)  # transposed
-        for i, l in enumerate(label):
-            l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.stack(depth, 0), torch.cat(label, 0), torch.cat(intr, 0), torch.cat(extr, 0), path, shapes
 
     @staticmethod

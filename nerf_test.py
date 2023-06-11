@@ -13,13 +13,13 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, create_dataloader_nerf
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
-
+from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.CoordNerfUtils import *
 
 def createPoses():
@@ -96,14 +96,16 @@ def test(data,
         model.half()
 
     # Configure
-    model.eval()
+    train_nerf = False
+    model.train() if train_nerf else model.eval()
+    epochs = 20 if train_nerf else 1
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
             data = yaml.load(f, Loader=yaml.SafeLoader)
     check_dataset(data)  # check
     nc = 1 if single_cls else int(data['nc'])  # number of classes
-    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
+    iouv = torch.linspace(0.5, 0.25, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Logging
@@ -115,137 +117,179 @@ def test(data,
         if device.type != 'cpu':
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
+        path = "all_renders"
+        dataloader = create_dataloader_nerf(path, imgsz, batch_size, gs, opt, pad=0.5, rect=False,
                                        prefix=colorstr(f'{task}: '))[0]
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
 
+    featCh = [256, 512, 1024]
+    nerf = nn.ModuleList([nn.Conv2d(ch, ch, 1) for ch in featCh]).to(device).half()
+    if train_nerf:
+        optimizer = torch.optim.SGD(nerf.parameters(), lr=1e-1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10)
+    else:
+        if os.path.exists("./runs/nerf.pt"):
+            nerf = torch.load("./runs/nerf.pt")
+
+    # Model parameters
+    with open('data/hyp.scratch.p5.yaml') as f:
+        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
+    nl = model.model[-1].nl
+    hyp['box'] *= 3. / nl  # scale to layers
+    hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
+    hyp['label_smoothing'] = False
+    model.nc = nc  # attach number of classes to model
+    model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
+    #model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    compute_loss = ComputeLoss(model)  # init loss class
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
-    s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
+    s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-    for batch_i, (img, depths, targets, intr, extr, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
-        img = img.to(device, non_blocking=True)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        targets = targets.to(device)
-        nb, _, height, width = img.shape  # batch size, channels, height, width
+    for epoch in range(epochs):
+        print("Epoch: %d", epoch)
+        for batch_i, (img, depths, targets, intr, extr, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+            img = img.to(device, non_blocking=True)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+            img = img[0]
+            depths = depths[0]/1000.0
+            intr = intr.float().to(device)
+            extr = extr.float().to(device)
+            depths = depths.float().to(device)
+            nb, _, height, width = img.shape  # batch size, channels, height, width
 
-        with torch.no_grad():
-            # Run model
-            t = time_synchronized()
-            out, train_out = model.forward_MV(img, depths, [intr, extr], width, augment=augment)  # inference and training outputs
-            t0 += time_synchronized() - t
 
             # Compute loss
-            if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+            if train_nerf:
+                optimizer.zero_grad()
+                train_out = model.forward_MV(img, depths, [intr, extr], width, nerf,
+                                                  combine=True)  # inference and training outputs
+                curr_loss = compute_loss([x.float() for x in train_out], targets)[0]
+                curr_loss.backward(retain_graph=True)
+                optimizer.step() # box, obj, cls
+                continue
 
+            else:
+                # Run model
+                t = time_synchronized()
+                out, train_out = model.forward_MV(img, depths, [intr, extr], width, nerf,
+                                                  combine=True)  # inference and training outputs
+                t0 += time_synchronized() - t
             # Run NMS
+            out = out.detach()
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
             lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
             out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
             t1 += time_synchronized() - t
 
-        # Statistics per image
-        for si, pred in enumerate(out):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl = len(labels)
-            tcls = labels[:, 0].tolist() if nl else []  # target class
-            path = Path(paths[si])
-            seen += 1
+            # Statistics per image
+            for si, pred in enumerate(out):
+                labels = targets[targets[:, 0] == si, 1:]
+                nl = len(labels)
+                tcls = labels[:, 0].tolist() if nl else []  # target class
+                path = Path(paths[0][si])
+                seen += 1
 
-            if len(pred) == 0:
+                if len(pred) == 0:
+                    if nl:
+                        stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    continue
+
+                # Predictions
+                predn = pred.clone()
+                scale_coords(img[si].shape[1:], predn[:, :4], shapes[0][si][0], shapes[0][si][1])  # native-space pred
+
+                # Append to text file
+                if save_txt:
+                    gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
+                    for *xyxy, conf, cls in predn.tolist():
+                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                        with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
+                            f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+                # W&B logging - Media Panel Plots
+                if len(wandb_images) < log_imgs and wandb_logger.current_epoch > 0:  # Check for test operation
+                    if wandb_logger.current_epoch % wandb_logger.bbox_interval == 0:
+                        box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
+                                     "class_id": int(cls),
+                                     "box_caption": "%s %.3f" % (names[cls], conf),
+                                     "scores": {"class_score": conf},
+                                     "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
+                        boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
+                        wandb_images.append(wandb_logger.wandb.Image(img[si], boxes=boxes, caption=path.name))
+                wandb_logger.log_training_progress(predn, path, names) if wandb_logger and wandb_logger.wandb_run else None
+
+                # Append to pycocotools JSON dictionary
+                if save_json:
+                    # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
+                    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+                    box = xyxy2xywh(predn[:, :4])  # xywh
+                    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                    for p, b in zip(pred.tolist(), box.tolist()):
+                        jdict.append({'image_id': image_id,
+                                      'category_id': coco91class[int(p[5])] if is_coco else int(p[5]),
+                                      'bbox': [round(x, 3) for x in b],
+                                      'score': round(p[4], 5)})
+
+                # Assign all predictions as incorrect
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
                 if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
-                continue
+                    detected = []  # target indices
+                    tcls_tensor = labels[:, 0]
 
-            # Predictions
-            predn = pred.clone()
-            scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
+                    # target boxes
+                    tbox = xywh2xyxy(labels[:, 1:5])
+                    scale_coords(img[si].shape[1:], tbox, shapes[0][si][0], shapes[0][si][1])  # native-space labels
+                    if plots:
+                        confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
 
-            # Append to text file
-            if save_txt:
-                gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
-                for *xyxy, conf, cls in predn.tolist():
-                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                    line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
-                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    # Per target class
+                    for cls in torch.unique(tcls_tensor):
+                        ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                        pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
 
-            # W&B logging - Media Panel Plots
-            if len(wandb_images) < log_imgs and wandb_logger.current_epoch > 0:  # Check for test operation
-                if wandb_logger.current_epoch % wandb_logger.bbox_interval == 0:
-                    box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
-                                 "class_id": int(cls),
-                                 "box_caption": "%s %.3f" % (names[cls], conf),
-                                 "scores": {"class_score": conf},
-                                 "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
-                    boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
-                    wandb_images.append(wandb_logger.wandb.Image(img[si], boxes=boxes, caption=path.name))
-            wandb_logger.log_training_progress(predn, path, names) if wandb_logger and wandb_logger.wandb_run else None
+                        # Search for detections
+                        if pi.shape[0]:
+                            # Prediction to target ious
+                            ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)  # best ious, indices
 
-            # Append to pycocotools JSON dictionary
-            if save_json:
-                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
-                image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-                box = xyxy2xywh(predn[:, :4])  # xywh
-                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-                for p, b in zip(pred.tolist(), box.tolist()):
-                    jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(p[5])] if is_coco else int(p[5]),
-                                  'bbox': [round(x, 3) for x in b],
-                                  'score': round(p[4], 5)})
+                            # Append detections
+                            detected_set = set()
+                            for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                                d = ti[i[j]]  # detected target
+                                if d.item() not in detected_set:
+                                    detected_set.add(d.item())
+                                    detected.append(d)
+                                    correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                    if len(detected) == nl:  # all targets already located in image
+                                        break
 
-            # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
-            if nl:
-                detected = []  # target indices
-                tcls_tensor = labels[:, 0]
+                # Append statistics (correct, conf, pcls, tcls)
+                stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
-                if plots:
-                    confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
+            # Plot images
+            if plots and batch_i < 3:
+                f = [save_dir / f'test_batch{batch_i}_{j}_labels.jpg' for j in range(len(out))]  # labels
+                Thread(target=plot_images, args=(img, targets, paths[0], f, names), daemon=True).start()
+                f = [save_dir / f'test_batch{batch_i}_{j}_pred.jpg' for j in range(len(out))]  # predictions
+                Thread(target=plot_images, args=(img, output_to_target(out), paths[0], f, names), daemon=True).start()
 
-                # Per target class
-                for cls in torch.unique(tcls_tensor):
-                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
-
-                    # Search for detections
-                    if pi.shape[0]:
-                        # Prediction to target ious
-                        ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)  # best ious, indices
-
-                        # Append detections
-                        detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
-                            d = ti[i[j]]  # detected target
-                            if d.item() not in detected_set:
-                                detected_set.add(d.item())
-                                detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
-                                if len(detected) == nl:  # all targets already located in image
-                                    break
-
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
-        # Plot images
-        if plots and batch_i < 3:
-            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
-
+        if train_nerf:
+            scheduler.step()
+    if train_nerf:
+        torch.save(nerf, "./runs/nerf.pt")
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
@@ -318,7 +362,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='nerf_test.py')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov7.pt', help='model.pt path(s)')
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='*.data path')
-    parser.add_argument('--batch-size', type=int, default=4, help='size of each image batch')
+    parser.add_argument('--batch-size', type=int, default=1, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
@@ -334,14 +378,34 @@ if __name__ == '__main__':
     parser.add_argument('--project', default='runs/test', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
+    parser.add_argument('--no-trace', default=True, action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
 
-    imgsz = opt.img_size
+    torch.cuda.is_available()
+
+    if opt.task in ('train', 'val', 'test'):  # run normally
+        test(opt.data,
+             opt.weights,
+             opt.batch_size,
+             opt.img_size,
+             opt.conf_thres,
+             opt.iou_thres,
+             opt.save_json,
+             opt.single_cls,
+             opt.augment,
+             opt.verbose,
+             save_txt=opt.save_txt | opt.save_hybrid,
+             save_hybrid=opt.save_hybrid,
+             save_conf=opt.save_conf,
+             trace=not opt.no_trace,
+             v5_metric=opt.v5_metric
+             )
+
+    '''imgsz = opt.img_size
     weights = opt.weights
     device = opt.device
     nviews = opt.batch_size
@@ -390,7 +454,7 @@ if __name__ == '__main__':
 
     res = model.model[-1](newFeature)
 
-    print(res)
+    print(res)'''
 
 
 
