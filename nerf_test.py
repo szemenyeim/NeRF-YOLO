@@ -97,6 +97,7 @@ def test(data,
 
     # Configure
     train_nerf = False
+    save_feat = True
     model.train() if train_nerf else model.eval()
     epochs = 20 if train_nerf else 1
     if isinstance(data, str):
@@ -117,7 +118,7 @@ def test(data,
         if device.type != 'cpu':
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        path = "all_renders"
+        path = "scene_dataset/train"
         dataloader = create_dataloader_nerf(path, imgsz, batch_size, gs, opt, pad=0.5, rect=False,
                                        prefix=colorstr(f'{task}: '))[0]
 
@@ -156,7 +157,7 @@ def test(data,
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     for epoch in range(epochs):
         print("Epoch: %d", epoch)
-        for batch_i, (img, depths, targets, intr, extr, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+        for batch_i, (img, depths, features, targets, intr, extr, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
             img = img.to(device, non_blocking=True)
             img = img.half() if half else img.float()  # uint8 to fp16/32
             img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -172,17 +173,23 @@ def test(data,
             # Compute loss
             if train_nerf:
                 optimizer.zero_grad()
-                train_out = model.forward_MV(img, depths, [intr, extr], width, nerf,
+                train_out = model.forward_MV(img, depths, [intr, extr], width, nerf, features,
                                                   combine=True)  # inference and training outputs
                 curr_loss = compute_loss([x.float() for x in train_out], targets)[0]
                 curr_loss.backward(retain_graph=True)
                 optimizer.step() # box, obj, cls
                 continue
-
+            elif save_feat:
+                features = model.forward(img, feature=True)
+                for i, path in enumerate(paths[0]):
+                    path = path.split(".")[0] + "_feat.pt"
+                    feat = [features[0][i], features[1][i], features[2][i]]
+                    torch.save(feat, path)
+                continue
             else:
                 # Run model
                 t = time_synchronized()
-                out, train_out = model.forward_MV(img, depths, [intr, extr], width, nerf,
+                out, train_out = model.forward_MV(img, depths, [intr, extr], width, nerf, features,
                                                   combine=True)  # inference and training outputs
                 t0 += time_synchronized() - t
             # Run NMS

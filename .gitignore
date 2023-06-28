@@ -24,7 +24,7 @@
 !cfg/yolov3*.cfg
 
 nerfData/*
-all_renders/*
+scene_dataset/*
 
 storage.googleapis.com
 runs/*
@@ -264,3 +264,4 @@ com_crashlytics_export_strings.xml
 crashlytics.properties
 crashlytics-build.properties
 fabric.properties
+/scene_dataset.7z

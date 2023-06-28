@@ -728,6 +728,7 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
         self.scene_dirs = glob.glob1(path, "scene*")
         self.img_files = []
         self.depth_files = []
+        self.feat_files = []
         self.intr_files = []
         self.extr_files = []
         self.car_files = []
@@ -735,15 +736,17 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         for dir in self.scene_dirs:
             currDir = os.path.join(path, dir)
-            imgs = glob.glob1(currDir, "image*.png")
-            depths = glob.glob1(currDir, "depth*.png")
-            extr = glob.glob1(currDir, "extr*.npy")
-            intr = glob.glob1(currDir, "intr*.npy")
-            cars = glob.glob1(currDir+"/bounding_boxes", "car*.npz")
-            humans = glob.glob1(currDir+"/bounding_boxes", "human*.npz")
+            imgs = sorted(glob.glob1(currDir, "image*.png"))
+            depths = sorted(glob.glob1(currDir, "depth*.png"))
+            feats = sorted(glob.glob1(currDir, "image*.pt"))
+            extr = sorted(glob.glob1(currDir, "extr*.npy"))
+            intr = sorted(glob.glob1(currDir, "intr*.npy"))
+            cars = sorted(glob.glob1(currDir+"/bounding_boxes", "car*.npz"))
+            humans = sorted(glob.glob1(currDir+"/bounding_boxes", "human*.npz"))
 
             self.img_files.append(imgs)
             self.depth_files.append(depths)
+            self.feat_files.append(feats)
             self.intr_files.append(intr)
             self.extr_files.append(extr)
             self.car_files.append(cars)
@@ -767,6 +770,7 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         paths = self.img_files[index]
         d_paths = self.depth_files[index]
+        f_paths = self.feat_files[index]
         car_files = self.car_files[index]
         human_files = self.human_files[index]
         intr_filess = self.intr_files[index]
@@ -774,17 +778,25 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         images = []
         depths = []
+        features = []
         labels_ = []
         extrs = []
         intrs = []
         shapes = [[]]
 
-        for i, (path, d_path, intr_files, extr_files) in enumerate(zip(paths, d_paths, intr_filess, extr_filess)):
+        full_paths = []
+
+        for i, (path, d_path, f_path, intr_files, extr_files) in enumerate(zip(paths, d_paths, f_paths, intr_filess, extr_filess)):
             path = os.path.join(root, path)
             d_path = os.path.join(root, d_path)
+            f_path = os.path.join(root, f_path)
+
+            full_paths.append(path)
 
             img = cv2.imread(path)  # BGR
             depth = cv2.imread(d_path, -1)  # BGR
+            feature = torch.load(f_path)
+            features.append(feature)
 
             h0, w0 = img.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # resize image to img_size
@@ -897,12 +909,12 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         shapes = shapes[1:]
 
-        return torch.stack(images, 0), torch.stack(depths, 0), torch.cat(labels_, 0), torch.stack(intrs, 0), torch.stack(extrs, 0), self.img_files[index], shapes
+        return torch.stack(images, 0), torch.stack(depths, 0), torch.stack(features, 0), torch.cat(labels_, 0), torch.stack(intrs, 0), torch.stack(extrs, 0), full_paths, shapes
 
     @staticmethod
     def collate_fn(batch):
-        img, depth, label, intr, extr, path, shapes = zip(*batch)  # transposed
-        return torch.stack(img, 0), torch.stack(depth, 0), torch.cat(label, 0), torch.cat(intr, 0), torch.cat(extr, 0), path, shapes
+        img, depth, features, label, intr, extr, path, shapes = zip(*batch)  # transposed
+        return torch.stack(img, 0), torch.stack(depth, 0), torch.stack(features,0), torch.cat(label, 0), torch.cat(intr, 0), torch.cat(extr, 0), path, shapes
 
     @staticmethod
     def collate_fn4(batch):

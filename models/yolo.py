@@ -581,9 +581,10 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward_MV(self, x, depth, poses, imSize, nerf=None, combine=False):
+    def forward_MV(self, x, depth, poses, imSize, nerf=None, features=None, combine=False):
 
-        features = self.forward(x, feature=True)
+        if features is None:
+            features = self.forward(x, feature=True)
 
         if combine:
 
