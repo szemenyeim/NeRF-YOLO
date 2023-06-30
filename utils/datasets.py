@@ -796,6 +796,7 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
             img = cv2.imread(path)  # BGR
             depth = cv2.imread(d_path, -1)  # BGR
             feature = torch.load(f_path)
+            feature = [f.cpu() for f in feature]
             features.append(feature)
 
             h0, w0 = img.shape[:2]  # orig hw
@@ -909,12 +910,19 @@ class LoadImagesAndLabelsAndPoses(Dataset):  # for training/testing
 
         shapes = shapes[1:]
 
-        return torch.stack(images, 0), torch.stack(depths, 0), torch.stack(features, 0), torch.cat(labels_, 0), torch.stack(intrs, 0), torch.stack(extrs, 0), full_paths, shapes
+        feat_final = []
+        for level in range(3):
+            feat_for_level = []
+            for feat in features:
+                feat_for_level.append(feat[level])
+            feat_final.append(torch.stack(feat_for_level,0))
+
+        return torch.stack(images, 0), torch.stack(depths, 0), feat_final, torch.cat(labels_, 0), torch.stack(intrs, 0), torch.stack(extrs, 0), full_paths, shapes
 
     @staticmethod
     def collate_fn(batch):
         img, depth, features, label, intr, extr, path, shapes = zip(*batch)  # transposed
-        return torch.stack(img, 0), torch.stack(depth, 0), torch.stack(features,0), torch.cat(label, 0), torch.cat(intr, 0), torch.cat(extr, 0), path, shapes
+        return torch.stack(img, 0), torch.stack(depth, 0), features, torch.cat(label, 0), torch.cat(intr, 0), torch.cat(extr, 0), path, shapes
 
     @staticmethod
     def collate_fn4(batch):

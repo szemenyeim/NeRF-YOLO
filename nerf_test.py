@@ -96,10 +96,8 @@ def test(data,
         model.half()
 
     # Configure
-    train_nerf = False
-    save_feat = True
-    model.train() if train_nerf else model.eval()
-    epochs = 20 if train_nerf else 1
+    save_feat = False
+    epochs = 20
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
@@ -119,7 +117,10 @@ def test(data,
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         path = "scene_dataset/train"
+        path_val = "scene_dataset/val"
         dataloader = create_dataloader_nerf(path, imgsz, batch_size, gs, opt, pad=0.5, rect=False,
+                                       prefix=colorstr(f'{task}: '))[0]
+        val_dataloader = create_dataloader_nerf(path_val, imgsz, batch_size, gs, opt, pad=0.5, rect=False,
                                        prefix=colorstr(f'{task}: '))[0]
 
     if v5_metric:
@@ -127,10 +128,9 @@ def test(data,
 
     featCh = [256, 512, 1024]
     nerf = nn.ModuleList([nn.Conv2d(ch, ch, 1) for ch in featCh]).to(device).half()
-    if train_nerf:
-        optimizer = torch.optim.SGD(nerf.parameters(), lr=1e-1)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10)
-    else:
+    optimizer = torch.optim.SGD(nerf.parameters(), lr=1e-1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10)
+    if False:
         if os.path.exists("./runs/nerf.pt"):
             nerf = torch.load("./runs/nerf.pt")
 
@@ -147,16 +147,14 @@ def test(data,
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
     #model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     compute_loss = ComputeLoss(model)  # init loss class
-    seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
-    names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
-    coco91class = coco80_to_coco91_class()
-    s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.95')
-    p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    model.eval()
+    best_map = 0
     for epoch in range(epochs):
-        print("Epoch: %d", epoch)
+
+        total_loss = 0
+        s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.95')
+
+        # Train NeRF
         for batch_i, (img, depths, features, targets, intr, extr, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
             img = img.to(device, non_blocking=True)
             img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -167,19 +165,46 @@ def test(data,
             intr = intr.float().to(device)
             extr = extr.float().to(device)
             depths = depths.float().to(device)
+            features = features[0]
+            features = [feat.to(device) for feat in features]
             nb, _, height, width = img.shape  # batch size, channels, height, width
 
-
             # Compute loss
-            if train_nerf:
-                optimizer.zero_grad()
-                train_out = model.forward_MV(img, depths, [intr, extr], width, nerf, features,
-                                                  combine=True)  # inference and training outputs
-                curr_loss = compute_loss([x.float() for x in train_out], targets)[0]
-                curr_loss.backward(retain_graph=True)
-                optimizer.step() # box, obj, cls
-                continue
-            elif save_feat:
+            optimizer.zero_grad()
+            _, train_out = model.forward_MV(img, depths, [intr, extr], width, nerf, features,
+                                              combine=True)  # inference and training outputs
+            curr_loss = compute_loss([x.float() for x in train_out], targets)[0]
+            curr_loss.backward(retain_graph=True)
+            total_loss += curr_loss.cpu().item()
+            optimizer.step() # box, obj, cls
+
+        print("Train loss: %.4f" % total_loss)
+
+        seen = 0
+        confusion_matrix = ConfusionMatrix(nc=nc)
+        names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
+        coco91class = coco80_to_coco91_class()
+        p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+        loss = torch.zeros(3, device=device)
+        jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+
+        #Eval Nerf
+        for batch_i, (img, depths, features, targets, intr, extr, paths, shapes) in enumerate(tqdm(val_dataloader, desc=s)):
+            img = img.to(device, non_blocking=True)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+            img = img[0]
+            depths = depths[0]/1000.0
+            intr = intr.float().to(device)
+            extr = extr.float().to(device)
+
+            features = features[0]
+            features = [feat.to(device) for feat in features]
+            depths = depths.float().to(device)
+            nb, _, height, width = img.shape  # batch size, channels, height, width
+
+            if save_feat:
                 features = model.forward(img, feature=True)
                 for i, path in enumerate(paths[0]):
                     path = path.split(".")[0] + "_feat.pt"
@@ -293,23 +318,24 @@ def test(data,
                 f = [save_dir / f'test_batch{batch_i}_{j}_pred.jpg' for j in range(len(out))]  # predictions
                 Thread(target=plot_images, args=(img, output_to_target(out), paths[0], f, names), daemon=True).start()
 
-        if train_nerf:
-            scheduler.step()
-    if train_nerf:
-        torch.save(nerf, "./runs/nerf.pt")
-    # Compute statistics
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
-        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
-    else:
-        nt = torch.zeros(1)
+        # Compute statistics
+        stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+        if len(stats) and stats[0].any():
+            p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
+            ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+            mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+            nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+        else:
+            nt = torch.zeros(1)
 
-    # Print results
-    pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+        # Print results
+        pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
+        print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+        scheduler.step()
+        if best_map < map50:
+            best_map = map50
+            torch.save(nerf, "./runs/nerf.pt")
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
